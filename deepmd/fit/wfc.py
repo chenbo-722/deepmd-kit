@@ -3,13 +3,13 @@ import numpy as np
 from typing import Tuple, List
 
 from deepmd.env import tf
-from deepmd.common import ClassArg, add_data_requirement, get_activation_func, get_precision, activation_fn_dict, precision_dict, docstring_parameter
+from deepmd.common import ClassArg, add_data_requirement, get_activation_func, get_precision, ACTIVATION_FN_DICT, PRECISION_DICT, docstring_parameter
 from deepmd.utils.argcheck import list_to_doc
 from deepmd.utils.network import one_layer
 from deepmd.descriptor import DescrptLocFrame
 
-from deepmd.RunOptions import global_cvt_2_tf_float
-from deepmd.RunOptions import global_tf_float_precision
+from deepmd.run_options import global_cvt_2_tf_float
+from deepmd.run_options import GLOBAL_TF_FLOAT_PRECISION
 
 class WFCFitting () :
     """
@@ -95,4 +95,4 @@ class WFCFitting () :
             count += 1
         
         tf.summary.histogram('fitting_net_output', outs)
-        return tf.cast(tf.reshape(outs, [-1]),  global_tf_float_precision)
+        return tf.cast(tf.reshape(outs, [-1]),  GLOBAL_TF_FLOAT_PRECISION)

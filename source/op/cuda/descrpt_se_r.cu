@@ -84,9 +84,9 @@ __global__ void format_nlist_fill_a_se_r(const FPTYPE * coord,
                             const float rcut,
                             int_64 * key,
                             int * i_idx,
-                            const int MAGIC_NUMBER)
+                            const int MAX_NBOR_SIZE)
 {   
-    // <<<nloc, MAGIC_NUMBER>>>
+    // <<<nloc, MAX_NBOR_SIZE>>>
     const unsigned int idx = blockIdx.x;
     const unsigned int idy = blockIdx.y * blockDim.y + threadIdx.y;
     
@@ -98,7 +98,7 @@ __global__ void format_nlist_fill_a_se_r(const FPTYPE * coord,
     const int * nei_idx = jlist + jrange[i_idx[idx]];
     // dev_copy(nei_idx, &jlist[jrange[i_idx]], nsize);
 
-    int_64 * key_in = key + idx * MAGIC_NUMBER;
+    int_64 * key_in = key + idx * MAX_NBOR_SIZE;
 
     FPTYPE diff[3];
     const int & j_idx = nei_idx[idy];
@@ -121,7 +121,7 @@ __global__ void format_nlist_fill_b_se_r(int * nlist,
                             const int * sec_a,
                             const int sec_a_size,
                             int * nei_iter_dev,
-                            const int MAGIC_NUMBER)
+                            const int MAX_NBOR_SIZE)
 { 
 
     const unsigned int idy = blockIdx.x * blockDim.x + threadIdx.x;
@@ -132,13 +132,13 @@ __global__ void format_nlist_fill_b_se_r(int * nlist,
     
     int * row_nlist = nlist + idy * nlist_size;
     int * nei_iter = nei_iter_dev + idy * sec_a_size;
-    int_64 * key_out = key + nloc * MAGIC_NUMBER + idy * MAGIC_NUMBER;
+    int_64 * key_out = key + nloc * MAX_NBOR_SIZE + idy * MAX_NBOR_SIZE;
 
     for (int ii = 0; ii < sec_a_size; ii++) {
         nei_iter[ii] = sec_a[ii];
     }
     
-    for (unsigned int kk = 0; key_out[kk] != key_out[MAGIC_NUMBER - 1]; kk++) {
+    for (unsigned int kk = 0; key_out[kk] != key_out[MAX_NBOR_SIZE - 1]; kk++) {
         const int & nei_type = key_out[kk] / 1E15;
         if (nei_iter[nei_type] < sec_a[nei_type + 1]) {
             row_nlist[nei_iter[nei_type]++] = key_out[kk] % 100000;
@@ -147,8 +147,10 @@ __global__ void format_nlist_fill_b_se_r(int * nlist,
 }
 //it's ok!
 
-template<typename FPTYPE>
-__global__ void compute_descriptor_se_r (FPTYPE* descript,
+template<
+    typename FPTYPE,
+    int      THREADS_PER_BLOCK>
+__global__ void compute_descriptor_se_r(FPTYPE* descript,
                             const int ndescrpt,
                             FPTYPE* descript_deriv,
                             const int descript_deriv_size,
@@ -164,119 +166,61 @@ __global__ void compute_descriptor_se_r (FPTYPE* descript,
                             const float rmax,
                             const int sec_a_size)
 {   
-    // <<<nloc, sec_a.back()>>>
-    const unsigned int idx = blockIdx.x;
-    const unsigned int idy = blockIdx.y * blockDim.y + threadIdx.y;
-    const int idx_deriv = idy * 3;	// 4 components time 3 directions
-    const int idx_value = idy;	    // 4 components
-    if (idy >= sec_a_size) {return;}
+    // <<<nloc, TPB>>>
+    const unsigned int bid = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    // usually false...
+    if (tid >= sec_a_size) {
+        return;
+    }
+    // const int idx_deriv = idy * 4 * 3;	// 4 components time 3 directions
+    // const int idx_value = idy * 4;	// 4 components
+    int * row_nlist = nlist + bid * nlist_size;
+    FPTYPE * row_rij = rij + bid * rij_size;
+    FPTYPE * row_descript = descript + bid * ndescrpt;
+    FPTYPE * row_descript_deriv = descript_deriv + bid * descript_deriv_size;
 
-    // else {return;}
-    FPTYPE * row_descript = descript + idx * ndescrpt;
-    FPTYPE * row_descript_deriv = descript_deriv + idx * descript_deriv_size;
-    FPTYPE * row_rij = rij + idx * rij_size;
-    int * row_nlist = nlist + idx * nlist_size;
+    for (int ii = tid; ii < sec_a_size; ii += THREADS_PER_BLOCK) {
+        const int idx_value = ii;	// 4 components
+        const int idx_deriv = ii * 3;	// 4 components time 3 directions
+        if (row_nlist[ii] >= 0) {
+            FPTYPE rr[3]  = {0};
+            FPTYPE vv[3]  = {0};
+            FPTYPE dd     = 0;
+            const int & j_idx = row_nlist[ii];
+            for (int kk = 0; kk < 3; kk++) {
+                rr[kk] = coord[j_idx * 3 + kk] - coord[bid * 3 + kk];
+                row_rij[ii * 3 + kk] = rr[kk];
+            }
+            // const FPTYPE * rr = &row_rij[ii * 3];
+            FPTYPE nr2 = dev_dot(rr, rr);
+            FPTYPE inr = 1./sqrt(nr2);
+            FPTYPE nr = nr2 * inr;
+            FPTYPE inr2 = inr * inr;
+            FPTYPE inr4 = inr2 * inr2;
+            FPTYPE inr3 = inr4 * nr;
+            FPTYPE sw, dsw;
+            spline5_switch(sw, dsw, nr, rmin, rmax);
+            dd = (1./nr)       ;//* sw;
 
-    if (row_nlist[idy] >= 0) {
-        const int & j_idx = row_nlist[idy];
-        for (int kk = 0; kk < 3; kk++) {
-            row_rij[idy * 3 + kk] = coord[j_idx * 3 + kk] - coord[idx * 3 + kk];
+            vv[0] = (rr[0] * inr3 * sw - dd * dsw * rr[0] * inr); // avg[type[(idx_deriv + 0) / (ndescrpt * 3)] * ndescrpt + ((idx_deriv + 0) % (ndescrpt * 3)) / 3];
+            vv[1] = (rr[1] * inr3 * sw - dd * dsw * rr[1] * inr); // avg[type[(idx_deriv + 1) / (ndescrpt * 3)] * ndescrpt + ((idx_deriv + 1) % (ndescrpt * 3)) / 3];
+            vv[2] = (rr[2] * inr3 * sw - dd * dsw * rr[2] * inr); // avg[type[(idx_deriv + 2) / (ndescrpt * 3)] * ndescrpt + ((idx_deriv + 2) % (ndescrpt * 3)) / 3];
+            
+            // 4 value components
+            dd *= sw; // * descript[idx * ndescrpt + idx_value + 0]);// - avg[type[idx] * ndescrpt + idx_value + 0]) / std[type[idx] * ndescrpt + idx_value + 0];
+            for (int ii = 0; ii < 3; ii++) {
+                row_descript_deriv[idx_deriv + ii] = vv[ii] / std[type[bid] * ndescrpt + idx_value + ii / 3];
+            }
+            row_descript[idx_value] = (dd - avg[type[bid] * ndescrpt + idx_value]) / std[type[bid] * ndescrpt + idx_value];
         }
-        const FPTYPE * rr = &row_rij[idy * 3 + 0];
-        FPTYPE nr2 = dev_dot(rr, rr);
-        FPTYPE inr = 1./sqrt(nr2);
-        FPTYPE nr = nr2 * inr;
-        FPTYPE inr2 = inr * inr;
-        FPTYPE inr4 = inr2 * inr2;
-        FPTYPE inr3 = inr4 * nr;
-        FPTYPE sw, dsw;
-        spline5_switch(sw, dsw, nr, rmin, rmax);
-        row_descript[idx_value + 0] = (1./nr)       ;//* sw;
-
-        row_descript_deriv[idx_deriv + 0] = (rr[0] * inr3 * sw - row_descript[idx_value + 0] * dsw * rr[0] * inr); // avg[type[(idx_deriv + 0) / (ndescrpt * 3)] * ndescrpt + ((idx_deriv + 0) % (ndescrpt * 3)) / 3];
-        row_descript_deriv[idx_deriv + 1] = (rr[1] * inr3 * sw - row_descript[idx_value + 0] * dsw * rr[1] * inr); // avg[type[(idx_deriv + 1) / (ndescrpt * 3)] * ndescrpt + ((idx_deriv + 1) % (ndescrpt * 3)) / 3];
-        row_descript_deriv[idx_deriv + 2] = (rr[2] * inr3 * sw - row_descript[idx_value + 0] * dsw * rr[2] * inr); // avg[type[(idx_deriv + 2) / (ndescrpt * 3)] * ndescrpt + ((idx_deriv + 2) % (ndescrpt * 3)) / 3];
-        // 4 value components
-        row_descript[idx_value + 0] *= sw; // * descript[idx * ndescrpt + idx_value + 0]);// - avg[type[idx] * ndescrpt + idx_value + 0]) / std[type[idx] * ndescrpt + idx_value + 0];
-    }
-
-    for (int ii = 0; ii < 1; ii++) {
-        row_descript[idx_value + ii] = (row_descript[idx_value + ii] - avg[type[idx] * ndescrpt + idx_value + ii]) / std[type[idx] * ndescrpt + idx_value + ii];
-    }
-    // idy nloc, idx ndescrpt * 3
-    // descript_deriv[idy * ndescrpt * 3 + idx] = (descript_deriv_dev[idy * (ndescrpt * 3) + idx]) / std[type[idy] * ndescrpt + idx / 3];
-    for (int ii = 0; ii < 3; ii++) {
-        row_descript_deriv[idx_deriv + ii] /= std[type[idx] * ndescrpt + (idx_deriv + ii) / 3];
+        else {
+            // TODO: move it to the memset.
+            row_descript[idx_value] -= avg[type[bid] * ndescrpt + idx_value] / std[type[bid] * ndescrpt + idx_value];
+        }
     }
 }
 
-template<typename FPTYPE>
-void format_nbor_list_256 (
-    const FPTYPE* coord,
-    const int* type,
-    const int* jrange,
-    const int* jlist,
-    const int& nloc,       
-    const float& rcut_r, 
-    int * i_idx, 
-    int_64 * key
-) 
-{   
-    const int LEN = 256;
-    const int MAGIC_NUMBER = 256;
-    const int nblock = (MAGIC_NUMBER + LEN - 1) / LEN;
-    dim3 block_grid(nloc, nblock);
-    dim3 thread_grid(1, LEN);
-    format_nlist_fill_a_se_r
-    <<<block_grid, thread_grid>>> (
-        coord,
-        type,
-        jrange,
-        jlist,
-        rcut_r,
-        key,
-        i_idx,
-        MAGIC_NUMBER
-    );
-    const int ITEMS_PER_THREAD = 4;
-    const int BLOCK_THREADS = MAGIC_NUMBER / ITEMS_PER_THREAD;
-    // BlockSortKernel<NeighborInfo, BLOCK_THREADS, ITEMS_PER_THREAD><<<g_grid_size, BLOCK_THREADS>>> (
-    BlockSortKernel<int_64, BLOCK_THREADS, ITEMS_PER_THREAD> <<<nloc, BLOCK_THREADS>>> (key, key + nloc * MAGIC_NUMBER);
-}
-
-template<typename FPTYPE>
-void format_nbor_list_512 (
-    const FPTYPE* coord,
-    const int* type,
-    const int* jrange,
-    const int* jlist,
-    const int& nloc,       
-    const float& rcut_r, 
-    int * i_idx, 
-    int_64 * key
-) 
-{   
-    const int LEN = 256;
-    const int MAGIC_NUMBER = 512;
-    const int nblock = (MAGIC_NUMBER + LEN - 1) / LEN;
-    dim3 block_grid(nloc, nblock);
-    dim3 thread_grid(1, LEN);
-    format_nlist_fill_a_se_r
-    <<<block_grid, thread_grid>>> (
-        coord,
-        type,
-        jrange,
-        jlist,
-        rcut_r,
-        key,
-        i_idx,
-        MAGIC_NUMBER
-    );
-    const int ITEMS_PER_THREAD = 4;
-    const int BLOCK_THREADS = MAGIC_NUMBER / ITEMS_PER_THREAD;
-    // BlockSortKernel<NeighborInfo, BLOCK_THREADS, ITEMS_PER_THREAD><<<g_grid_size, BLOCK_THREADS>>> (
-    BlockSortKernel<int_64, BLOCK_THREADS, ITEMS_PER_THREAD> <<<nloc, BLOCK_THREADS>>> (key, key + nloc * MAGIC_NUMBER);
-}
 
 template<typename FPTYPE>
 void format_nbor_list_1024 (
@@ -291,8 +235,8 @@ void format_nbor_list_1024 (
 ) 
 {   
     const int LEN = 256;
-    const int MAGIC_NUMBER = 1024;
-    const int nblock = (MAGIC_NUMBER + LEN - 1) / LEN;
+    const int MAX_NBOR_SIZE = 1024;
+    const int nblock = (MAX_NBOR_SIZE + LEN - 1) / LEN;
     dim3 block_grid(nloc, nblock);
     dim3 thread_grid(1, LEN);
     format_nlist_fill_a_se_r
@@ -304,12 +248,12 @@ void format_nbor_list_1024 (
         rcut_r,
         key,
         i_idx,
-        MAGIC_NUMBER
+        MAX_NBOR_SIZE
     );
     const int ITEMS_PER_THREAD = 8;
-    const int BLOCK_THREADS = MAGIC_NUMBER / ITEMS_PER_THREAD;
+    const int BLOCK_THREADS = MAX_NBOR_SIZE / ITEMS_PER_THREAD;
     // BlockSortKernel<NeighborInfo, BLOCK_THREADS, ITEMS_PER_THREAD><<<g_grid_size, BLOCK_THREADS>>> (
-    BlockSortKernel<int_64, BLOCK_THREADS, ITEMS_PER_THREAD> <<<nloc, BLOCK_THREADS>>> (key, key + nloc * MAGIC_NUMBER);
+    BlockSortKernel<int_64, BLOCK_THREADS, ITEMS_PER_THREAD> <<<nloc, BLOCK_THREADS>>> (key, key + nloc * MAX_NBOR_SIZE);
 }
 
 template<typename FPTYPE>
@@ -325,8 +269,8 @@ void format_nbor_list_2048 (
 ) 
 {   
     const int LEN = 256;
-    const int MAGIC_NUMBER = 2048;
-    const int nblock = (MAGIC_NUMBER + LEN - 1) / LEN;
+    const int MAX_NBOR_SIZE = 2048;
+    const int nblock = (MAX_NBOR_SIZE + LEN - 1) / LEN;
     dim3 block_grid(nloc, nblock);
     dim3 thread_grid(1, LEN);
     format_nlist_fill_a_se_r
@@ -338,12 +282,12 @@ void format_nbor_list_2048 (
         rcut_r,
         key,
         i_idx,
-        MAGIC_NUMBER
+        MAX_NBOR_SIZE
     );
     const int ITEMS_PER_THREAD = 8;
-    const int BLOCK_THREADS = MAGIC_NUMBER / ITEMS_PER_THREAD;
+    const int BLOCK_THREADS = MAX_NBOR_SIZE / ITEMS_PER_THREAD;
     // BlockSortKernel<NeighborInfo, BLOCK_THREADS, ITEMS_PER_THREAD><<<g_grid_size, BLOCK_THREADS>>> (
-    BlockSortKernel<int_64, BLOCK_THREADS, ITEMS_PER_THREAD> <<<nloc, BLOCK_THREADS>>> (key, key + nloc * MAGIC_NUMBER);
+    BlockSortKernel<int_64, BLOCK_THREADS, ITEMS_PER_THREAD> <<<nloc, BLOCK_THREADS>>> (key, key + nloc * MAX_NBOR_SIZE);
 }
 
 template<typename FPTYPE>
@@ -359,8 +303,8 @@ void format_nbor_list_4096 (
 ) 
 {   
     const int LEN = 256;
-    const int MAGIC_NUMBER = 4096;
-    const int nblock = (MAGIC_NUMBER + LEN - 1) / LEN;
+    const int MAX_NBOR_SIZE = 4096;
+    const int nblock = (MAX_NBOR_SIZE + LEN - 1) / LEN;
     dim3 block_grid(nloc, nblock);
     dim3 thread_grid(1, LEN);
     format_nlist_fill_a_se_r
@@ -372,16 +316,16 @@ void format_nbor_list_4096 (
         rcut_r,
         key,
         i_idx,
-        MAGIC_NUMBER
+        MAX_NBOR_SIZE
     );
     const int ITEMS_PER_THREAD = 16;
-    const int BLOCK_THREADS = MAGIC_NUMBER / ITEMS_PER_THREAD;
+    const int BLOCK_THREADS = MAX_NBOR_SIZE / ITEMS_PER_THREAD;
     // BlockSortKernel<NeighborInfo, BLOCK_THREADS, ITEMS_PER_THREAD><<<g_grid_size, BLOCK_THREADS>>> (
-    BlockSortKernel<int_64, BLOCK_THREADS, ITEMS_PER_THREAD> <<<nloc, BLOCK_THREADS>>> (key, key + nloc * MAGIC_NUMBER);
+    BlockSortKernel<int_64, BLOCK_THREADS, ITEMS_PER_THREAD> <<<nloc, BLOCK_THREADS>>> (key, key + nloc * MAX_NBOR_SIZE);
 }
 
 template <typename FPTYPE>
-void DescrptSeRGPUExecuteFunctor<FPTYPE>::operator()(const FPTYPE * coord, const int * type, const int * ilist, const int * jrange, const int * jlist, int * array_int, unsigned long long * array_longlong, const FPTYPE * avg, const FPTYPE * std, FPTYPE * descript, FPTYPE * descript_deriv, FPTYPE * rij, int * nlist, const int nloc, const int nall, const int nnei, const int ndescrpt, const float rcut_r, const float rcut_r_smth, const std::vector<int> sec_a, const bool fill_nei_a, const int MAGIC_NUMBER) {
+void DescrptSeRGPUExecuteFunctor<FPTYPE>::operator()(const FPTYPE * coord, const int * type, const int * ilist, const int * jrange, const int * jlist, int * array_int, unsigned long long * array_longlong, const FPTYPE * avg, const FPTYPE * std, FPTYPE * descript, FPTYPE * descript_deriv, FPTYPE * rij, int * nlist, const int nloc, const int nall, const int nnei, const int ndescrpt, const float rcut_r, const float rcut_r_smth, const std::vector<int> sec_a, const bool fill_nei_a, const int max_nbor_size) {
     const int LEN = 256;
     int nblock = (nloc + LEN -1) / LEN;
     int * sec_a_dev = array_int;
@@ -391,7 +335,7 @@ void DescrptSeRGPUExecuteFunctor<FPTYPE>::operator()(const FPTYPE * coord, const
     
     cudaError_t res = cudaSuccess;
     res = cudaMemcpy(sec_a_dev, &sec_a[0], sizeof(int) * sec_a.size(), cudaMemcpyHostToDevice); cudaErrcheck(res);    
-    res = cudaMemset(key, 0xffffffff, sizeof(int_64) * nloc * MAGIC_NUMBER); cudaErrcheck(res);
+    res = cudaMemset(key, 0xffffffff, sizeof(int_64) * nloc * max_nbor_size); cudaErrcheck(res);
     res = cudaMemset(nlist, -1, sizeof(int) * nloc * nnei); cudaErrcheck(res);
     res = cudaMemset(descript, 0.0, sizeof(FPTYPE) * nloc * ndescrpt); cudaErrcheck(res);
     res = cudaMemset(descript_deriv, 0.0, sizeof(FPTYPE) * nloc * ndescrpt * 3); cudaErrcheck(res);
@@ -401,29 +345,7 @@ void DescrptSeRGPUExecuteFunctor<FPTYPE>::operator()(const FPTYPE * coord, const
         // cudaProfilerStart();
         get_i_idx_se_r<<<nblock, LEN>>> (nloc, ilist, i_idx);
 
-        if (nnei <= 256) {
-            format_nbor_list_256 (
-                coord,
-                type,
-                jrange,
-                jlist,
-                nloc,       
-                rcut_r, 
-                i_idx, 
-                key
-            ); 
-        } else if (nnei <= 512) {
-            format_nbor_list_512 (
-                coord,
-                type,
-                jrange,
-                jlist,
-                nloc,       
-                rcut_r, 
-                i_idx, 
-                key
-            ); 
-        } else if (nnei <= 1024) {
+        if (max_nbor_size <= 1024) {
             format_nbor_list_1024 (
                 coord,
                 type,
@@ -434,7 +356,7 @@ void DescrptSeRGPUExecuteFunctor<FPTYPE>::operator()(const FPTYPE * coord, const
                 i_idx, 
                 key
             ); 
-        } else if (nnei <= 2048) {
+        } else if (max_nbor_size <= 2048) {
             format_nbor_list_2048 (
                 coord,
                 type,
@@ -445,7 +367,7 @@ void DescrptSeRGPUExecuteFunctor<FPTYPE>::operator()(const FPTYPE * coord, const
                 i_idx, 
                 key
             ); 
-        } else if (nnei <= 4096) {
+        } else if (max_nbor_size <= 4096) {
             format_nbor_list_4096 (
                 coord,
                 type,
@@ -468,30 +390,11 @@ void DescrptSeRGPUExecuteFunctor<FPTYPE>::operator()(const FPTYPE * coord, const
                             sec_a_dev,
                             sec_a.size(),
                             nei_iter,
-                            MAGIC_NUMBER
+                            max_nbor_size
         );
     }
 
-    const int nblock_ = (sec_a.back() + LEN -1) / LEN;
-    dim3 block_grid(nloc, nblock_);
-    dim3 thread_grid(1, LEN);
-    compute_descriptor_se_r<<<block_grid, thread_grid>>> (
-                            descript,
-                            ndescrpt,
-                            descript_deriv,
-                            ndescrpt * 3,
-                            rij,
-                            nnei * 3,
-                            type,
-                            avg,
-                            std,
-                            nlist,
-                            nnei,
-                            coord,
-                            rcut_r_smth,
-                            rcut_r,
-                            sec_a.back()
-    );
+    compute_descriptor_se_r<FPTYPE, TPB> <<<nloc, TPB>>> (descript, ndescrpt, descript_deriv, ndescrpt * 3, rij, nnei * 3, type, avg, std, nlist, nnei, coord, rcut_r_smth, rcut_r, sec_a.back());
 }
 
 template struct DescrptSeRGPUExecuteFunctor<float>;
